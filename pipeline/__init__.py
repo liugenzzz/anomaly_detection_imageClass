@@ -1,0 +1,2 @@
+"""Modular data-processing pipeline."""
+
