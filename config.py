@@ -119,6 +119,9 @@ TASK_CLASSIFICATION_CONFIG = {
     "progress_log_interval": 100,
     "save_provider_raw_response": False,
     "write_summary": True,
+    # "auto": draw a live progress bar only when stderr is a real terminal
+    # (never on redirected/nohup/CI output); True/False force it on/off.
+    "progress_bar": "auto",
 }
 
 
@@ -140,4 +143,5 @@ TASK_ORGANIZATION_CONFIG = {
     "manifest_file": PROJECT_ROOT / "data_by_task" / "manifest.jsonl",
     "summary_file": PROJECT_ROOT / "data_by_task" / "summary.json",
     "progress_log_interval": 100,
+    "progress_bar": "auto",
 }

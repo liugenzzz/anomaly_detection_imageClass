@@ -20,8 +20,9 @@ from config import (
 )
 from pipeline.core.checkpoint import CheckpointStore
 from pipeline.core.image_io import iter_image_paths, read_image_payload
-from pipeline.core.logging_utils import setup_stage_logger
+from pipeline.core.logging_utils import setup_stage_logger, suppress_console_progress_lines
 from pipeline.core.model_client import call_chat_completion
+from pipeline.core.progress import ProgressBar
 from pipeline.fusion.unanimous import unanimous_vote
 from pipeline.stages.task_type.prompts import (
     build_level1_messages,
@@ -173,15 +174,29 @@ def classify_dataset(
     futures = set()
     max_workers = max(1, int(TASK_CLASSIFICATION_CONFIG["image_max_workers"]))
 
+    # iter_image_paths already sorts (fully materializes) the glob result, so
+    # this costs nothing extra beyond what the loop below did anyway, and it
+    # gives the progress bar a real total up front.
+    image_paths = list(iter_image_paths(input_dir, DATA_CONFIG["recursive"]))
+
     logger.info(
-        "classification started input_dir=%s output_dir=%s dry_run=%s resume=%s providers=%s image_workers=%s",
+        "classification started input_dir=%s output_dir=%s dry_run=%s resume=%s providers=%s image_workers=%s total_images=%s",
         input_dir,
         output_dir,
         dry_run,
         resume,
         [provider["name"] for provider in providers],
         max_workers,
+        len(image_paths),
     )
+
+    progress_bar = ProgressBar(
+        total=len(image_paths),
+        desc="分类进度",
+        mode=TASK_CLASSIFICATION_CONFIG["progress_bar"],
+    )
+    if progress_bar.active:
+        suppress_console_progress_lines(logger)
 
     try:
         csv_exists = resume and csv_path.exists() and csv_path.stat().st_size > 0
@@ -191,11 +206,12 @@ def classify_dataset(
             if not csv_exists:
                 csv_writer.writeheader()
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                for path in iter_image_paths(input_dir, DATA_CONFIG["recursive"]):
+                for path in image_paths:
                     relative_path = str(path.relative_to(input_dir))
                     counters["seen"] += 1
                     if resume and checkpoint.is_done(relative_path):
                         counters["skipped_checkpoint"] += 1
+                        progress_bar.update(1, 跳过=counters["skipped_checkpoint"], 失败=counters["failed"])
                         continue
 
                     futures.add(
@@ -216,6 +232,7 @@ def classify_dataset(
                             checkpoint,
                             counters,
                             logger,
+                            progress_bar,
                         )
 
                 while futures:
@@ -226,8 +243,10 @@ def classify_dataset(
                         checkpoint,
                         counters,
                         logger,
+                        progress_bar,
                     )
     finally:
+        progress_bar.close()
         checkpoint.close()
 
     summary = _build_summary_from_csv(csv_path, dry_run=dry_run)
@@ -485,6 +504,7 @@ def _drain_completed(
     checkpoint: CheckpointStore,
     counters: Counter,
     logger: logging.Logger,
+    progress_bar: ProgressBar,
 ) -> None:
     done, pending = wait(futures, return_when=FIRST_COMPLETED)
     futures.clear()
@@ -494,6 +514,8 @@ def _drain_completed(
         csv_writer.writerow(_record_to_csv_row(record))
         csv_file.flush()
         counters["processed"] += 1
+        if record.get("final", {}).get("best_task_type") == "其它异常":
+            counters["其它异常"] += 1
         provider_failures = [
             result
             for result in (
@@ -516,6 +538,12 @@ def _drain_completed(
             counters["failed"] += 1
         if status != "failed" or TASK_CLASSIFICATION_CONFIG["checkpoint_failed"]:
             checkpoint.mark_done(record)
+        progress_bar.update(
+            1,
+            处理中=len(pending),
+            失败=counters["failed"],
+            其它异常=counters["其它异常"],
+        )
         if counters["processed"] % TASK_CLASSIFICATION_CONFIG["progress_log_interval"] == 0:
             logger.info(
                 "progress processed=%s skipped_checkpoint=%s failed=%s",

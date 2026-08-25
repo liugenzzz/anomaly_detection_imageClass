@@ -7,7 +7,8 @@ from collections import Counter
 from pathlib import Path
 
 from config import ANOMALY_TYPES_BY_TASK, TASK_ORGANIZATION_CONFIG, TASK_TYPES
-from pipeline.core.logging_utils import setup_stage_logger
+from pipeline.core.logging_utils import setup_stage_logger, suppress_console_progress_lines
+from pipeline.core.progress import ProgressBar
 
 
 def organize_by_task_type(
@@ -38,6 +39,15 @@ def organize_by_task_type(
         TASK_ORGANIZATION_CONFIG["materialize_files"],
     )
 
+    total_records = _count_records(results_file)
+    progress_bar = ProgressBar(
+        total=total_records,
+        desc="整理进度",
+        mode=TASK_ORGANIZATION_CONFIG["progress_bar"],
+    )
+    if progress_bar.active:
+        suppress_console_progress_lines(logger)
+
     with manifest_file.open("w", encoding="utf-8") as manifest:
         for record in _iter_records(results_file):
             counters["seen"] += 1
@@ -52,6 +62,7 @@ def organize_by_task_type(
                     f"secondary::{item['best_task_type']}::{item['best_anomaly_type']}"
                 ] += 1
             manifest.write(json.dumps(item, ensure_ascii=False) + "\n")
+            progress_bar.update(1, 缺失源文件=counters["missing_source"])
 
             if counters["seen"] % TASK_ORGANIZATION_CONFIG["progress_log_interval"] == 0:
                 manifest.flush()
@@ -61,6 +72,7 @@ def organize_by_task_type(
                     counters["organized"],
                     counters["missing_source"],
                 )
+    progress_bar.close()
 
     summary = {
         "stage": TASK_ORGANIZATION_CONFIG["stage_name"],
@@ -148,6 +160,18 @@ def _organize_one_record(input_dir: Path, output_dir: Path, record: dict) -> dic
         shutil.move(str(source), str(destination))
         item["action"] = "moved"
     return item
+
+
+def _count_records(results_file: Path) -> int:
+    """Cheap line count for the progress bar's total (no field parsing)."""
+    if not results_file.exists():
+        return 0
+    if results_file.suffix.lower() == ".csv":
+        with results_file.open("r", encoding="utf-8-sig", newline="") as file:
+            total_lines = sum(1 for _ in file)
+        return max(total_lines - 1, 0)  # exclude header row
+    with results_file.open("r", encoding="utf-8") as file:
+        return sum(1 for line in file if line.strip())
 
 
 def _iter_records(results_file: Path):

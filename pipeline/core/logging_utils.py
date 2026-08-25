@@ -30,3 +30,23 @@ def setup_stage_logger(stage_name: str, output_dir: Path | None = None) -> loggi
 
     return logger
 
+
+def suppress_console_progress_lines(logger: logging.Logger, prefix: str = "progress ") -> None:
+    """Drop periodic ``progress ...`` lines from console output only.
+
+    Used when a live progress bar is drawn on the same stream, so the two
+    don't fight over the terminal; the file handler keeps receiving every
+    line for later inspection.
+    """
+
+    class _PrefixFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return not record.getMessage().startswith(prefix)
+
+    prefix_filter = _PrefixFilter()
+    for handler in logger.handlers:
+        if isinstance(handler, logging.StreamHandler) and not isinstance(
+            handler, logging.FileHandler
+        ):
+            handler.addFilter(prefix_filter)
+
