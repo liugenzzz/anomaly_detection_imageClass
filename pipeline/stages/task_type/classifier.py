@@ -145,11 +145,13 @@ def classify_dataset(
     providers: list[dict] | None = None,
     dry_run: bool = False,
     resume: bool | None = None,
+    recursive: bool | None = None,
 ) -> dict:
     input_dir = input_dir or DATA_CONFIG["input_dir"]
     output_dir = output_dir or TASK_CLASSIFICATION_CONFIG["output_dir"]
     providers = providers or PROVIDERS
     resume = TASK_CLASSIFICATION_CONFIG["resume"] if resume is None else resume
+    recursive = DATA_CONFIG["recursive"] if recursive is None else recursive
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger = setup_stage_logger(TASK_CLASSIFICATION_CONFIG["stage_name"], output_dir)
@@ -177,14 +179,15 @@ def classify_dataset(
     # iter_image_paths already sorts (fully materializes) the glob result, so
     # this costs nothing extra beyond what the loop below did anyway, and it
     # gives the progress bar a real total up front.
-    image_paths = list(iter_image_paths(input_dir, DATA_CONFIG["recursive"]))
+    image_paths = list(iter_image_paths(input_dir, recursive))
 
     logger.info(
-        "classification started input_dir=%s output_dir=%s dry_run=%s resume=%s providers=%s image_workers=%s total_images=%s",
+        "classification started input_dir=%s output_dir=%s dry_run=%s resume=%s recursive=%s providers=%s image_workers=%s total_images=%s",
         input_dir,
         output_dir,
         dry_run,
         resume,
+        recursive,
         [provider["name"] for provider in providers],
         max_workers,
         len(image_paths),

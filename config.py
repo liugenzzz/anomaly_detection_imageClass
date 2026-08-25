@@ -76,7 +76,11 @@ PROVIDERS = [
 
 DATA_CONFIG = {
     "input_dir": PROJECT_ROOT / "data",
-    "recursive": False,
+    # True: walk all subdirectories under input_dir (needed when the dataset
+    # is split across many subfolders, e.g. cvdata_clean001/, cvdata_clean002/,
+    # ...). False only looks at files directly inside input_dir and silently
+    # skips everything in subfolders.
+    "recursive": True,
     "allowed_mime_types": {
         "image/jpeg",
         "image/png",

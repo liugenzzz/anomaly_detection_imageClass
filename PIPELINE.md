@@ -56,6 +56,14 @@ python run_pipeline.py --run-stages classify
 python run_pipeline.py --run-stages organize
 ```
 
+数据集分散在多个子文件夹（比如 `cvdata_clean001/`、`cvdata_clean002/`、...）时，需要递归扫描：
+
+```bash
+python run_pipeline.py --input-dir /path/to/dataset_root --recursive
+```
+
+`DATA_CONFIG["recursive"]` 默认已经是 `True`（会递归扫描 `input_dir` 下所有子目录）；只有当图片明确都在 `input_dir` 顶层、且子目录里有其它不想被扫描的内容时才需要显式传 `--no-recursive` 关掉。
+
 从外部 JSON 动态加载模型池：
 
 ```bash
