@@ -4,6 +4,7 @@ import csv
 import json
 import logging
 import threading
+import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
@@ -74,6 +75,9 @@ class ProviderRuntime:
         self.failure_threshold = TASK_CLASSIFICATION_CONFIG[
             "disable_provider_after_consecutive_failures"
         ]
+        self.reenable_cooldown_seconds = TASK_CLASSIFICATION_CONFIG[
+            "provider_reenable_cooldown_seconds"
+        ]
         self.semaphores = {
             provider["name"]: threading.BoundedSemaphore(
                 max(1, int(provider.get("max_concurrency", 1)))
@@ -81,29 +85,54 @@ class ProviderRuntime:
             for provider in providers
         }
         self.consecutive_failures = {provider["name"]: 0 for provider in providers}
-        self.disabled = set()
+        # provider_name -> monotonic timestamp of the most recent disable event.
+        # A provider stays disabled only until the cooldown elapses, at which
+        # point one probe request is let through (a half-open retry) instead
+        # of the provider being permanently excluded from voting for the rest
+        # of the run.
+        self.disabled_at: dict[str, float] = {}
         self.lock = threading.Lock()
 
     def is_disabled(self, provider_name: str) -> bool:
         with self.lock:
-            return provider_name in self.disabled
+            disabled_at = self.disabled_at.get(provider_name)
+            if disabled_at is None:
+                return False
+            if time.monotonic() - disabled_at < self.reenable_cooldown_seconds:
+                return True
+            # Cooldown elapsed: let one probe request through. If it fails
+            # again, register_failure immediately re-disables and resets the
+            # cooldown timer below.
+            self.logger.info(
+                "provider cooldown elapsed, probing for recovery: %s",
+                provider_name,
+            )
+            return False
 
     def register_success(self, provider_name: str) -> None:
         with self.lock:
             self.consecutive_failures[provider_name] = 0
+            if self.disabled_at.pop(provider_name, None) is not None:
+                self.logger.warning(
+                    "provider recovered and re-enabled: %s", provider_name
+                )
 
     def register_failure(self, provider_name: str, error: str) -> None:
         with self.lock:
             failures = self.consecutive_failures.get(provider_name, 0) + 1
             self.consecutive_failures[provider_name] = failures
-            if failures >= self.failure_threshold and provider_name not in self.disabled:
-                self.disabled.add(provider_name)
-                self.logger.warning(
-                    "provider disabled after %s consecutive failures: %s; last_error=%s",
-                    failures,
-                    provider_name,
-                    error,
-                )
+            if failures >= self.failure_threshold:
+                was_disabled = provider_name in self.disabled_at
+                self.disabled_at[provider_name] = time.monotonic()
+                if not was_disabled:
+                    self.logger.warning(
+                        "provider disabled after %s consecutive failures: %s; "
+                        "last_error=%s; will retry after %ss",
+                        failures,
+                        provider_name,
+                        error,
+                        self.reenable_cooldown_seconds,
+                    )
 
     def semaphore_for(self, provider_name: str) -> threading.BoundedSemaphore:
         return self.semaphores[provider_name]

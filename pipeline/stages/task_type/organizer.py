@@ -29,11 +29,13 @@ def organize_by_task_type(
 
     counters = Counter()
     logger.info(
-        "organization started input_dir=%s results_file=%s output_dir=%s copy_files=%s",
+        "organization started input_dir=%s results_file=%s output_dir=%s "
+        "copy_files=%s materialize_files=%s",
         input_dir,
         results_file,
         output_dir,
         TASK_ORGANIZATION_CONFIG["copy_files"],
+        TASK_ORGANIZATION_CONFIG["materialize_files"],
     )
 
     with manifest_file.open("w", encoding="utf-8") as manifest:
@@ -66,6 +68,7 @@ def organize_by_task_type(
         "total_files": counters["organized"],
         "missing_source": counters["missing_source"],
         "copy_files": TASK_ORGANIZATION_CONFIG["copy_files"],
+        "materialize_files": TASK_ORGANIZATION_CONFIG["materialize_files"],
         "label_counts": {
             task_type: counters[task_type]
             for task_type in TASK_TYPES
@@ -126,6 +129,13 @@ def _organize_one_record(input_dir: Path, output_dir: Path, record: dict) -> dic
     }
     if not source.exists():
         item["action"] = "missing_source"
+        return item
+
+    if not TASK_ORGANIZATION_CONFIG["materialize_files"]:
+        # Manifest-only mode: record the source/destination mapping without
+        # touching any file on disk. manifest.jsonl is the mapping table;
+        # downstream consumers resolve the original file via relative_path.
+        item["action"] = "manifest_only"
         return item
 
     destination.parent.mkdir(parents=True, exist_ok=True)

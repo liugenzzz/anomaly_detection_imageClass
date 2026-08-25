@@ -155,7 +155,7 @@ data_by_task/
 - 图片级并发：`image_max_workers` 控制同时处理的图片数。
 - 模型级并发：每个 provider 使用自身 `max_concurrency` 限流，避免压垮单个模型服务。
 - 动态模型池：可用 `--provider-config` 从外部 JSON 加载模型配置，或用 `--providers` 选择子集。
-- 模型故障隔离：单个模型调用失败不会阻断批处理，也不会参与本次投票；只要其余有效模型达到最小数量、标签一致并通过阈值，仍可接受分类。某模型连续失败达到阈值后会在本轮任务中自动禁用。
+- 模型故障隔离：单个模型调用失败不会阻断批处理，也不会参与本次投票；只要其余有效模型达到最小数量、标签一致并通过阈值，仍可接受分类。某模型连续失败达到阈值后会被临时禁用，禁用满 `provider_reenable_cooldown_seconds` 后自动放行一次探测请求；探测成功则恢复参与投票，失败则重新计时继续禁用，不会在整轮任务中永久失效。
 - 日志监控：每个阶段在输出目录写入 `<stage>.log`，同时输出关键进度到控制台。
 
 相关配置项在 `config.py`：
@@ -168,6 +168,7 @@ TASK_CLASSIFICATION_CONFIG["min_valid_provider_count"]
 TASK_CLASSIFICATION_CONFIG["level1_score_threshold"]
 TASK_CLASSIFICATION_CONFIG["level2_score_threshold"]
 TASK_CLASSIFICATION_CONFIG["disable_provider_after_consecutive_failures"]
+TASK_CLASSIFICATION_CONFIG["provider_reenable_cooldown_seconds"]
 TASK_CLASSIFICATION_CONFIG["resume"]
 TASK_CLASSIFICATION_CONFIG["checkpoint_file"]
 TASK_CLASSIFICATION_CONFIG["progress_log_interval"]
@@ -204,6 +205,8 @@ TASK_ORGANIZATION_CONFIG["progress_log_interval"]
 ## 分类整理说明
 
 `task-organize` 流式读取 `outputs/task_type_classification/results.csv` 中每张图片的 `best_task_type` 和 `best_anomaly_type`，按两级标签复制图片。该阶段不重新判断图片内容，也不读取文件名前缀作为类别；历史 JSONL 仅保留只读兼容能力。
+
+`TASK_ORGANIZATION_CONFIG["materialize_files"]` 默认为 `True`（按 `copy_files` 拷贝或移动原图）。数据量很大时可设为 `False`：不再拷贝/移动任何文件，只把 `relative_path -> best_task_type/best_anomaly_type` 的映射写入 `manifest.jsonl`（每条记录的 `action` 为 `manifest_only`），下游按 `relative_path` 回原始目录取图即可，避免整份数据集重复落盘。
 
 标准流程是直接运行 `python run_pipeline.py`。该默认流程会先运行 `task-classify` 生成模型分类结果，再运行 `task-organize` 做目录整理。
 
