@@ -14,9 +14,19 @@ MIME_BY_MAGIC = (
 )
 
 
+# Fixed, not config-driven: a quick filename filter so a dataset directory
+# mixed with non-image files (json/tar.gz/scripts/etc.) doesn't get fully
+# read + hashed just to be thrown away later as invalid_image.
+IMAGE_FILE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+
+
 def iter_image_paths(input_dir: Path, recursive: bool):
     pattern = "**/*" if recursive else "*"
-    yield from sorted(path for path in input_dir.glob(pattern) if path.is_file())
+    yield from sorted(
+        path
+        for path in input_dir.glob(pattern)
+        if path.suffix.lower() in IMAGE_FILE_EXTENSIONS and path.is_file()
+    )
 
 
 def detect_mime_type(image_bytes: bytes) -> str | None:

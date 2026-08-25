@@ -64,6 +64,20 @@ python run_pipeline.py --input-dir /path/to/dataset_root --recursive
 
 `DATA_CONFIG["recursive"]` 默认已经是 `True`（会递归扫描 `input_dir` 下所有子目录）；只有当图片明确都在 `input_dir` 顶层、且子目录里有其它不想被扫描的内容时才需要显式传 `--no-recursive` 关掉。
 
+扫描时按固定后缀名（`.jpg/.jpeg/.png/.webp/.gif/.bmp`，大小写不敏感）预过滤，目录里混杂的 json/tar.gz/脚本等非图片文件不会被读取和计算哈希，也不会计入统计总数。
+
+数据量大、想用多个进程/多台机器并行处理时，用 `--shard-index`/`--shard-count` 把数据集切成 N 份（对已排序的完整路径列表按下标取模，纯本地计算，不需要真的搬动/复制文件，各分片之间也不用互相协调）：
+
+```bash
+# 起 4 个进程各处理 1/4 的数据，各自独立的 output-dir/checkpoint/results.csv/manifest.jsonl
+python run_pipeline.py task-classify --input-dir /path/to/dataset_root --shard-index 0 --shard-count 4 &
+python run_pipeline.py task-classify --input-dir /path/to/dataset_root --shard-index 1 --shard-count 4 &
+python run_pipeline.py task-classify --input-dir /path/to/dataset_root --shard-index 2 --shard-count 4 &
+python run_pipeline.py task-classify --input-dir /path/to/dataset_root --shard-index 3 --shard-count 4 &
+```
+
+每个分片会落在 `<output-dir>/shard_{i}_of_{N}/` 下，互相隔离。**分片数量不是越多越快**——各分片进程里的 provider 并发限流（`max_concurrency`）是进程内独立的，不会互相感知，多个分片同时压向同一个并发受限的 provider（比如本项目里 `fx_q3_235` 被设成 `max_concurrency=1`）反而更容易把它打挂、触发更多失败。分片前先确认模型服务端能扛住的总并发，再决定分几片、每片里各 provider 的 `max_concurrency` 设多少。跑完之后如果需要一份合并的 `results.csv`，各分片 schema 一致，直接 `cat` 起来去掉多余表头即可；`manifest.jsonl` 没有表头，直接 `cat` 拼接。
+
 从外部 JSON 动态加载模型池：
 
 ```bash
@@ -216,9 +230,13 @@ TASK_ORGANIZATION_CONFIG["progress_log_interval"]
 
 `TASK_ORGANIZATION_CONFIG["materialize_files"]` 默认为 `True`（按 `copy_files` 拷贝或移动原图）。数据量很大时可设为 `False`：不再拷贝/移动任何文件，只把 `relative_path -> best_task_type/best_anomaly_type` 的映射写入 `manifest.jsonl`（每条记录的 `action` 为 `manifest_only`），下游按 `relative_path` 回原始目录取图即可，避免整份数据集重复落盘。
 
-标准流程是直接运行 `python run_pipeline.py`。该默认流程会先运行 `task-classify` 生成模型分类结果，再运行 `task-organize` 做目录整理。
+**`materialize_files=False` 时不需要再手动跑 `task-organize`**：`task-classify` 会在每张图片分类完成的同时，直接把这条映射写进 `<classification_output_dir>/manifest.jsonl`（跟 `results.csv` 同目录、同样逐条 flush，断点续跑时也是追加而不是重写），字段和独立跑 `task-organize` 产出的完全一致。默认全流程（`python run_pipeline.py`，即 `--run-stages all`）检测到这个配置时会自动跳过 organize 阶段（`summaries.task_organize.reason` 是 `manifest_already_written_inline_by_classify`），不会重复读一遍 `results.csv` 白跑一次。分片模式（见上面 `--shard-index`/`--shard-count`）下每个分片各自产出自己的 `manifest.jsonl`，合并方式同 `results.csv`，直接 `cat` 拼接。
 
-如果使用 `--dry-run`，分类阶段只检查输入输出链路，不产生可用标签；默认完整流程会自动跳过整理阶段。
+如果 `materialize_files=True`（要真的复制/移动文件），仍然需要单独的 `task-organize` 阶段来做这部分 IO——真实文件搬运不适合塞进分类阶段的网络并发线程池里，行为跟以前一样不变。
+
+标准流程是直接运行 `python run_pipeline.py`。该默认流程会先运行 `task-classify` 生成模型分类结果，`materialize_files=True` 时再运行 `task-organize` 做目录整理；`materialize_files=False` 时 organize 会被自动跳过（见上）。
+
+如果使用 `--dry-run`，分类阶段只检查输入输出链路，不产生可用标签、也不写 `manifest.jsonl`；默认完整流程会自动跳过整理阶段。
 
 整理阶段输出：
 

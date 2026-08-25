@@ -101,6 +101,23 @@ def main() -> None:
         action="store_true",
         help="Disable checkpoint resume and rebuild classification outputs.",
     )
+    classify_parser.add_argument(
+        "--shard-count",
+        type=int,
+        default=None,
+        help=(
+            "Split the dataset into this many shards for parallel processes "
+            "(each shard writes to its own <output-dir>/shard_i_of_N/ with an "
+            "independent results.csv/checkpoint/manifest, no coordination "
+            "needed between processes). Requires --shard-index."
+        ),
+    )
+    classify_parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+        help="0-based index of this process's shard. Requires --shard-count.",
+    )
 
     organize_parser = subparsers.add_parser(
         "task-organize",
@@ -122,6 +139,8 @@ def main() -> None:
             dry_run=args.dry_run,
             resume=not args.no_resume,
             recursive=args.recursive,
+            shard_index=args.shard_index,
+            shard_count=args.shard_count,
         )
     elif args.stage == "task-organize":
         summary = organize_by_task_type(
@@ -159,6 +178,18 @@ def run_default_pipeline(args: argparse.Namespace) -> dict:
                 "stage": TASK_ORGANIZATION_CONFIG["stage_name"],
                 "skipped": True,
                 "reason": "dry_run_classification_has_no_final_labels",
+            }
+        elif args.run_stages == "all" and not TASK_ORGANIZATION_CONFIG["materialize_files"]:
+            # classify_dataset already wrote <classification_output_dir>/manifest.jsonl
+            # inline in this case (see classifier.py's write_inline_manifest) —
+            # running organize again would just rebuild the same mapping from
+            # results.csv a second time for no benefit. `--run-stages organize`
+            # on its own still works if you ever need to force a rebuild.
+            summaries["task_organize"] = {
+                "stage": TASK_ORGANIZATION_CONFIG["stage_name"],
+                "skipped": True,
+                "reason": "manifest_already_written_inline_by_classify",
+                "manifest_file": str(args.classification_output_dir / "manifest.jsonl"),
             }
         else:
             summaries["task_organize"] = organize_by_task_type(

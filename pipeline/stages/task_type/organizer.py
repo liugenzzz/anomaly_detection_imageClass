@@ -9,6 +9,7 @@ from pathlib import Path
 from config import ANOMALY_TYPES_BY_TASK, TASK_ORGANIZATION_CONFIG, TASK_TYPES
 from pipeline.core.logging_utils import setup_stage_logger, suppress_console_progress_lines
 from pipeline.core.progress import ProgressBar
+from pipeline.stages.task_type.labels import build_destination_path, resolve_organization_labels
 
 
 def organize_by_task_type(
@@ -112,25 +113,14 @@ def organize_by_task_type(
 
 
 def _organize_one_record(input_dir: Path, output_dir: Path, record: dict) -> dict:
-    task_type = record.get("final", {}).get("best_task_type")
-    if task_type not in TASK_TYPES:
-        task_type = TASK_ORGANIZATION_CONFIG["unclassified_dir"]
-
-    if task_type == TASK_ORGANIZATION_CONFIG["unclassified_dir"]:
-        anomaly_type = TASK_ORGANIZATION_CONFIG["unclassified_dir"]
-    elif task_type == "其它异常":
-        anomaly_type = "其它异常"
-    else:
-        anomaly_type = record.get("final", {}).get("best_anomaly_type")
-        if anomaly_type not in ANOMALY_TYPES_BY_TASK[task_type]:
-            anomaly_type = "其它任务类型"
+    task_type, anomaly_type = resolve_organization_labels(
+        record.get("final", {}).get("best_task_type"),
+        record.get("final", {}).get("best_anomaly_type"),
+    )
 
     relative_path = Path(record["relative_path"])
     source = input_dir / relative_path
-    if task_type in {"其它异常", TASK_ORGANIZATION_CONFIG["unclassified_dir"]}:
-        destination = output_dir / task_type / relative_path
-    else:
-        destination = output_dir / task_type / anomaly_type / relative_path
+    destination = build_destination_path(output_dir, task_type, anomaly_type, relative_path)
     item = {
         "source": str(source),
         "destination": str(destination),
