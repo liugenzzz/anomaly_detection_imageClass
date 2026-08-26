@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from config import PROVIDERS, TASK_CLASSIFICATION_CONFIG, TASK_ORGANIZATION_CONFIG
+from config import DATA_CONFIG, PROVIDERS, TASK_CLASSIFICATION_CONFIG, TASK_ORGANIZATION_CONFIG
 from pipeline.core.provider_pool import load_provider_pool
 from pipeline.stages.task_type.classifier import classify_dataset
 from pipeline.stages.task_type.organizer import organize_by_task_type
@@ -18,6 +18,16 @@ def main() -> None:
         help="Default run mode when no subcommand is provided. Defaults to all.",
     )
     parser.add_argument("--input-dir", type=Path, default=None)
+    parser.add_argument(
+        "--recursive",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Walk all subdirectories under --input-dir (needed when images "
+            "are split across many subfolders). Defaults to "
+            "DATA_CONFIG['recursive'] in config.py when not passed."
+        ),
+    )
     parser.add_argument(
         "--classification-output-dir",
         type=Path,
@@ -63,6 +73,12 @@ def main() -> None:
         help="Run two-level image anomaly classification",
     )
     classify_parser.add_argument("--input-dir", type=Path, default=None)
+    classify_parser.add_argument(
+        "--recursive",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Walk all subdirectories under --input-dir. Defaults to config.py's DATA_CONFIG['recursive'].",
+    )
     classify_parser.add_argument("--output-dir", type=Path, default=TASK_CLASSIFICATION_CONFIG["output_dir"])
     classify_parser.add_argument(
         "--providers",
@@ -85,6 +101,23 @@ def main() -> None:
         action="store_true",
         help="Disable checkpoint resume and rebuild classification outputs.",
     )
+    classify_parser.add_argument(
+        "--shard-count",
+        type=int,
+        default=None,
+        help=(
+            "Split the dataset into this many shards for parallel processes "
+            "(each shard writes to its own <output-dir>/shard_i_of_N/ with an "
+            "independent results.csv/checkpoint/manifest, no coordination "
+            "needed between processes). Requires --shard-index."
+        ),
+    )
+    classify_parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+        help="0-based index of this process's shard. Requires --shard-count.",
+    )
 
     organize_parser = subparsers.add_parser(
         "task-organize",
@@ -105,6 +138,9 @@ def main() -> None:
             providers=selected_providers,
             dry_run=args.dry_run,
             resume=not args.no_resume,
+            recursive=args.recursive,
+            shard_index=args.shard_index,
+            shard_count=args.shard_count,
         )
     elif args.stage == "task-organize":
         summary = organize_by_task_type(
@@ -133,6 +169,7 @@ def run_default_pipeline(args: argparse.Namespace) -> dict:
             providers=selected_providers,
             dry_run=args.dry_run,
             resume=not args.no_resume,
+            recursive=args.recursive,
         )
 
     if args.run_stages in {"all", "organize"}:
@@ -141,6 +178,18 @@ def run_default_pipeline(args: argparse.Namespace) -> dict:
                 "stage": TASK_ORGANIZATION_CONFIG["stage_name"],
                 "skipped": True,
                 "reason": "dry_run_classification_has_no_final_labels",
+            }
+        elif args.run_stages == "all" and not TASK_ORGANIZATION_CONFIG["materialize_files"]:
+            # classify_dataset already wrote <classification_output_dir>/manifest.jsonl
+            # inline in this case (see classifier.py's write_inline_manifest) —
+            # running organize again would just rebuild the same mapping from
+            # results.csv a second time for no benefit. `--run-stages organize`
+            # on its own still works if you ever need to force a rebuild.
+            summaries["task_organize"] = {
+                "stage": TASK_ORGANIZATION_CONFIG["stage_name"],
+                "skipped": True,
+                "reason": "manifest_already_written_inline_by_classify",
+                "manifest_file": str(args.classification_output_dir / "manifest.jsonl"),
             }
         else:
             summaries["task_organize"] = organize_by_task_type(

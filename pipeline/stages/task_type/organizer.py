@@ -7,7 +7,9 @@ from collections import Counter
 from pathlib import Path
 
 from config import ANOMALY_TYPES_BY_TASK, TASK_ORGANIZATION_CONFIG, TASK_TYPES
-from pipeline.core.logging_utils import setup_stage_logger
+from pipeline.core.logging_utils import setup_stage_logger, suppress_console_progress_lines
+from pipeline.core.progress import ProgressBar
+from pipeline.stages.task_type.labels import build_destination_path, resolve_organization_labels
 
 
 def organize_by_task_type(
@@ -29,12 +31,23 @@ def organize_by_task_type(
 
     counters = Counter()
     logger.info(
-        "organization started input_dir=%s results_file=%s output_dir=%s copy_files=%s",
+        "organization started input_dir=%s results_file=%s output_dir=%s "
+        "copy_files=%s materialize_files=%s",
         input_dir,
         results_file,
         output_dir,
         TASK_ORGANIZATION_CONFIG["copy_files"],
+        TASK_ORGANIZATION_CONFIG["materialize_files"],
     )
+
+    total_records = _count_records(results_file)
+    progress_bar = ProgressBar(
+        total=total_records,
+        desc="整理进度",
+        mode=TASK_ORGANIZATION_CONFIG["progress_bar"],
+    )
+    if progress_bar.active:
+        suppress_console_progress_lines(logger)
 
     with manifest_file.open("w", encoding="utf-8") as manifest:
         for record in _iter_records(results_file):
@@ -50,6 +63,7 @@ def organize_by_task_type(
                     f"secondary::{item['best_task_type']}::{item['best_anomaly_type']}"
                 ] += 1
             manifest.write(json.dumps(item, ensure_ascii=False) + "\n")
+            progress_bar.update(1, 缺失源文件=counters["missing_source"])
 
             if counters["seen"] % TASK_ORGANIZATION_CONFIG["progress_log_interval"] == 0:
                 manifest.flush()
@@ -59,6 +73,7 @@ def organize_by_task_type(
                     counters["organized"],
                     counters["missing_source"],
                 )
+    progress_bar.close()
 
     summary = {
         "stage": TASK_ORGANIZATION_CONFIG["stage_name"],
@@ -66,6 +81,7 @@ def organize_by_task_type(
         "total_files": counters["organized"],
         "missing_source": counters["missing_source"],
         "copy_files": TASK_ORGANIZATION_CONFIG["copy_files"],
+        "materialize_files": TASK_ORGANIZATION_CONFIG["materialize_files"],
         "label_counts": {
             task_type: counters[task_type]
             for task_type in TASK_TYPES
@@ -97,25 +113,14 @@ def organize_by_task_type(
 
 
 def _organize_one_record(input_dir: Path, output_dir: Path, record: dict) -> dict:
-    task_type = record.get("final", {}).get("best_task_type")
-    if task_type not in TASK_TYPES:
-        task_type = TASK_ORGANIZATION_CONFIG["unclassified_dir"]
-
-    if task_type == TASK_ORGANIZATION_CONFIG["unclassified_dir"]:
-        anomaly_type = TASK_ORGANIZATION_CONFIG["unclassified_dir"]
-    elif task_type == "其它异常":
-        anomaly_type = "其它异常"
-    else:
-        anomaly_type = record.get("final", {}).get("best_anomaly_type")
-        if anomaly_type not in ANOMALY_TYPES_BY_TASK[task_type]:
-            anomaly_type = "其它任务类型"
+    task_type, anomaly_type = resolve_organization_labels(
+        record.get("final", {}).get("best_task_type"),
+        record.get("final", {}).get("best_anomaly_type"),
+    )
 
     relative_path = Path(record["relative_path"])
     source = input_dir / relative_path
-    if task_type in {"其它异常", TASK_ORGANIZATION_CONFIG["unclassified_dir"]}:
-        destination = output_dir / task_type / relative_path
-    else:
-        destination = output_dir / task_type / anomaly_type / relative_path
+    destination = build_destination_path(output_dir, task_type, anomaly_type, relative_path)
     item = {
         "source": str(source),
         "destination": str(destination),
@@ -128,6 +133,13 @@ def _organize_one_record(input_dir: Path, output_dir: Path, record: dict) -> dic
         item["action"] = "missing_source"
         return item
 
+    if not TASK_ORGANIZATION_CONFIG["materialize_files"]:
+        # Manifest-only mode: record the source/destination mapping without
+        # touching any file on disk. manifest.jsonl is the mapping table;
+        # downstream consumers resolve the original file via relative_path.
+        item["action"] = "manifest_only"
+        return item
+
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists() and not TASK_ORGANIZATION_CONFIG["overwrite"]:
         raise FileExistsError(destination)
@@ -138,6 +150,18 @@ def _organize_one_record(input_dir: Path, output_dir: Path, record: dict) -> dic
         shutil.move(str(source), str(destination))
         item["action"] = "moved"
     return item
+
+
+def _count_records(results_file: Path) -> int:
+    """Cheap line count for the progress bar's total (no field parsing)."""
+    if not results_file.exists():
+        return 0
+    if results_file.suffix.lower() == ".csv":
+        with results_file.open("r", encoding="utf-8-sig", newline="") as file:
+            total_lines = sum(1 for _ in file)
+        return max(total_lines - 1, 0)  # exclude header row
+    with results_file.open("r", encoding="utf-8") as file:
+        return sum(1 for line in file if line.strip())
 
 
 def _iter_records(results_file: Path):

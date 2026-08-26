@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import csv
 import json
 import logging
 import threading
+import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
@@ -15,13 +17,16 @@ from config import (
     DATA_CONFIG,
     PROVIDERS,
     TASK_CLASSIFICATION_CONFIG,
+    TASK_ORGANIZATION_CONFIG,
     TASK_TYPES,
 )
 from pipeline.core.checkpoint import CheckpointStore
 from pipeline.core.image_io import iter_image_paths, read_image_payload
-from pipeline.core.logging_utils import setup_stage_logger
+from pipeline.core.logging_utils import setup_stage_logger, suppress_console_progress_lines
 from pipeline.core.model_client import call_chat_completion
+from pipeline.core.progress import ProgressBar
 from pipeline.fusion.unanimous import unanimous_vote
+from pipeline.stages.task_type.labels import build_destination_path, resolve_organization_labels
 from pipeline.stages.task_type.prompts import (
     build_level1_messages,
     build_level2_messages,
@@ -74,6 +79,9 @@ class ProviderRuntime:
         self.failure_threshold = TASK_CLASSIFICATION_CONFIG[
             "disable_provider_after_consecutive_failures"
         ]
+        self.reenable_cooldown_seconds = TASK_CLASSIFICATION_CONFIG[
+            "provider_reenable_cooldown_seconds"
+        ]
         self.semaphores = {
             provider["name"]: threading.BoundedSemaphore(
                 max(1, int(provider.get("max_concurrency", 1)))
@@ -81,29 +89,54 @@ class ProviderRuntime:
             for provider in providers
         }
         self.consecutive_failures = {provider["name"]: 0 for provider in providers}
-        self.disabled = set()
+        # provider_name -> monotonic timestamp of the most recent disable event.
+        # A provider stays disabled only until the cooldown elapses, at which
+        # point one probe request is let through (a half-open retry) instead
+        # of the provider being permanently excluded from voting for the rest
+        # of the run.
+        self.disabled_at: dict[str, float] = {}
         self.lock = threading.Lock()
 
     def is_disabled(self, provider_name: str) -> bool:
         with self.lock:
-            return provider_name in self.disabled
+            disabled_at = self.disabled_at.get(provider_name)
+            if disabled_at is None:
+                return False
+            if time.monotonic() - disabled_at < self.reenable_cooldown_seconds:
+                return True
+            # Cooldown elapsed: let one probe request through. If it fails
+            # again, register_failure immediately re-disables and resets the
+            # cooldown timer below.
+            self.logger.info(
+                "provider cooldown elapsed, probing for recovery: %s",
+                provider_name,
+            )
+            return False
 
     def register_success(self, provider_name: str) -> None:
         with self.lock:
             self.consecutive_failures[provider_name] = 0
+            if self.disabled_at.pop(provider_name, None) is not None:
+                self.logger.warning(
+                    "provider recovered and re-enabled: %s", provider_name
+                )
 
     def register_failure(self, provider_name: str, error: str) -> None:
         with self.lock:
             failures = self.consecutive_failures.get(provider_name, 0) + 1
             self.consecutive_failures[provider_name] = failures
-            if failures >= self.failure_threshold and provider_name not in self.disabled:
-                self.disabled.add(provider_name)
-                self.logger.warning(
-                    "provider disabled after %s consecutive failures: %s; last_error=%s",
-                    failures,
-                    provider_name,
-                    error,
-                )
+            if failures >= self.failure_threshold:
+                was_disabled = provider_name in self.disabled_at
+                self.disabled_at[provider_name] = time.monotonic()
+                if not was_disabled:
+                    self.logger.warning(
+                        "provider disabled after %s consecutive failures: %s; "
+                        "last_error=%s; will retry after %ss",
+                        failures,
+                        provider_name,
+                        error,
+                        self.reenable_cooldown_seconds,
+                    )
 
     def semaphore_for(self, provider_name: str) -> threading.BoundedSemaphore:
         return self.semaphores[provider_name]
@@ -115,11 +148,30 @@ def classify_dataset(
     providers: list[dict] | None = None,
     dry_run: bool = False,
     resume: bool | None = None,
+    recursive: bool | None = None,
+    shard_index: int | None = None,
+    shard_count: int | None = None,
 ) -> dict:
     input_dir = input_dir or DATA_CONFIG["input_dir"]
     output_dir = output_dir or TASK_CLASSIFICATION_CONFIG["output_dir"]
     providers = providers or PROVIDERS
     resume = TASK_CLASSIFICATION_CONFIG["resume"] if resume is None else resume
+    recursive = DATA_CONFIG["recursive"] if recursive is None else recursive
+
+    if shard_count is not None:
+        if shard_count < 1:
+            raise ValueError(f"shard_count must be positive: {shard_count}")
+        if shard_index is None or not (0 <= shard_index < shard_count):
+            raise ValueError(
+                f"shard_index must be in [0, {shard_count}) when shard_count is set: {shard_index!r}"
+            )
+        if shard_count > 1:
+            # Each shard gets its own results.csv/checkpoint/log/manifest so
+            # parallel processes never write to the same files. Sharding is
+            # purely a deterministic split of the already-sorted path list,
+            # so it needs no coordination between processes and no physical
+            # data movement.
+            output_dir = output_dir / f"shard_{shard_index:03d}_of_{shard_count:03d}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger = setup_stage_logger(TASK_CLASSIFICATION_CONFIG["stage_name"], output_dir)
@@ -129,44 +181,96 @@ def classify_dataset(
     if output_dir != TASK_CLASSIFICATION_CONFIG["output_dir"]:
         checkpoint_path = output_dir / "checkpoint.sqlite3"
 
+    manifest_path = output_dir / "manifest.jsonl"
+
     if resume and csv_path.exists():
         _validate_resume_csv(csv_path)
     if not resume:
-        _reset_outputs(csv_path, summary_path, checkpoint_path)
+        _reset_outputs(csv_path, summary_path, checkpoint_path, manifest_path)
 
     checkpoint_existed = checkpoint_path.exists()
     checkpoint = CheckpointStore(checkpoint_path)
     if resume and csv_path.exists() and not checkpoint_existed:
         restored = _bootstrap_checkpoint_from_csv(csv_path, checkpoint)
         logger.info("checkpoint restored from results_csv restored=%s", restored)
+
+    # When organize would only ever write a manifest (no real file copy/move),
+    # produce that same manifest.jsonl straight out of classify instead of
+    # requiring a separate `task-organize` pass afterward. Left alone when
+    # materialize_files=True, since real file IO belongs in its own stage,
+    # not mixed into this thread pool's network-bound work.
+    write_inline_manifest = not dry_run and not TASK_ORGANIZATION_CONFIG["materialize_files"]
+    if write_inline_manifest and resume and csv_path.exists() and not manifest_path.exists():
+        # Covers switching materialize_files True -> False (or upgrading from
+        # an older run) mid-dataset: already-checkpointed images will never
+        # go through _drain_completed again, so they'd otherwise be missing
+        # from the manifest forever. Rebuild it once from the existing CSV.
+        restored = _bootstrap_manifest_from_csv(csv_path, manifest_path, input_dir)
+        logger.info("manifest bootstrapped from existing results_csv restored=%s", restored)
+
     provider_runtime = ProviderRuntime(providers, logger)
     counters = Counter()
     futures = set()
     max_workers = max(1, int(TASK_CLASSIFICATION_CONFIG["image_max_workers"]))
 
+    # iter_image_paths already sorts (fully materializes) the glob result, so
+    # this costs nothing extra beyond what the loop below did anyway, and it
+    # gives the progress bar a real total up front.
+    image_paths = list(iter_image_paths(input_dir, recursive))
+    total_dataset_images = len(image_paths)
+    if shard_count and shard_count > 1:
+        # Deterministic split over the stable sort order: every shard process
+        # sees the exact same full listing and only keeps every Nth path, so
+        # shards never overlap and never miss a file without needing to talk
+        # to each other.
+        image_paths = image_paths[shard_index::shard_count]
+
     logger.info(
-        "classification started input_dir=%s output_dir=%s dry_run=%s resume=%s providers=%s image_workers=%s",
+        "classification started input_dir=%s output_dir=%s dry_run=%s resume=%s "
+        "recursive=%s shard=%s/%s providers=%s image_workers=%s total_dataset_images=%s shard_images=%s",
         input_dir,
         output_dir,
         dry_run,
         resume,
+        recursive,
+        shard_index,
+        shard_count,
         [provider["name"] for provider in providers],
         max_workers,
+        total_dataset_images,
+        len(image_paths),
     )
+
+    progress_bar = ProgressBar(
+        total=len(image_paths),
+        desc="分类进度",
+        mode=TASK_CLASSIFICATION_CONFIG["progress_bar"],
+    )
+    if progress_bar.active:
+        suppress_console_progress_lines(logger)
+
+    if write_inline_manifest:
+        logger.info("inline manifest enabled, writing %s alongside results.csv", manifest_path)
 
     try:
         csv_exists = resume and csv_path.exists() and csv_path.stat().st_size > 0
         mode = "a" if csv_exists else "w"
-        with csv_path.open(mode, encoding="utf-8-sig", newline="") as csv_file:
+        manifest_cm = (
+            manifest_path.open(mode, encoding="utf-8")
+            if write_inline_manifest
+            else contextlib.nullcontext()
+        )
+        with csv_path.open(mode, encoding="utf-8-sig", newline="") as csv_file, manifest_cm as manifest_file:
             csv_writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDNAMES)
             if not csv_exists:
                 csv_writer.writeheader()
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                for path in iter_image_paths(input_dir, DATA_CONFIG["recursive"]):
+                for path in image_paths:
                     relative_path = str(path.relative_to(input_dir))
                     counters["seen"] += 1
                     if resume and checkpoint.is_done(relative_path):
                         counters["skipped_checkpoint"] += 1
+                        progress_bar.update(1, 跳过=counters["skipped_checkpoint"], 失败=counters["failed"])
                         continue
 
                     futures.add(
@@ -187,6 +291,9 @@ def classify_dataset(
                             checkpoint,
                             counters,
                             logger,
+                            progress_bar,
+                            manifest_file,
+                            input_dir,
                         )
 
                 while futures:
@@ -197,8 +304,12 @@ def classify_dataset(
                         checkpoint,
                         counters,
                         logger,
+                        progress_bar,
+                        manifest_file,
+                        input_dir,
                     )
     finally:
+        progress_bar.close()
         checkpoint.close()
 
     summary = _build_summary_from_csv(csv_path, dry_run=dry_run)
@@ -456,6 +567,9 @@ def _drain_completed(
     checkpoint: CheckpointStore,
     counters: Counter,
     logger: logging.Logger,
+    progress_bar: ProgressBar,
+    manifest_file=None,
+    input_dir: Path | None = None,
 ) -> None:
     done, pending = wait(futures, return_when=FIRST_COMPLETED)
     futures.clear()
@@ -464,7 +578,15 @@ def _drain_completed(
         record = future.result()
         csv_writer.writerow(_record_to_csv_row(record))
         csv_file.flush()
+        if manifest_file is not None:
+            manifest_file.write(
+                json.dumps(_record_to_manifest_item(record, input_dir), ensure_ascii=False)
+                + "\n"
+            )
+            manifest_file.flush()
         counters["processed"] += 1
+        if record.get("final", {}).get("best_task_type") == "其它异常":
+            counters["其它异常"] += 1
         provider_failures = [
             result
             for result in (
@@ -487,6 +609,12 @@ def _drain_completed(
             counters["failed"] += 1
         if status != "failed" or TASK_CLASSIFICATION_CONFIG["checkpoint_failed"]:
             checkpoint.mark_done(record)
+        progress_bar.update(
+            1,
+            处理中=len(pending),
+            失败=counters["failed"],
+            其它异常=counters["其它异常"],
+        )
         if counters["processed"] % TASK_CLASSIFICATION_CONFIG["progress_log_interval"] == 0:
             logger.info(
                 "progress processed=%s skipped_checkpoint=%s failed=%s",
@@ -560,6 +688,32 @@ def _record_to_csv_row(record: dict) -> dict:
     }
 
 
+def _record_to_manifest_item(record: dict, input_dir: Path) -> dict:
+    """Same shape organizer.py's manifest-only mode writes, produced inline
+    so a separate `task-organize` pass isn't needed when materialize_files
+    is False. The source file is guaranteed to exist here (classify just
+    read it), so unlike the standalone organizer this never needs to
+    re-check the filesystem.
+    """
+    final = record.get("final", {})
+    relative_path = Path(record["relative_path"])
+    task_type, anomaly_type = resolve_organization_labels(
+        final.get("best_task_type"), final.get("best_anomaly_type")
+    )
+    destination = build_destination_path(
+        TASK_ORGANIZATION_CONFIG["output_dir"], task_type, anomaly_type, relative_path
+    )
+    return {
+        "source": str(input_dir / relative_path),
+        "destination": str(destination),
+        "relative_path": record["relative_path"],
+        "best_task_type": task_type,
+        "best_anomaly_type": anomaly_type,
+        "decision_status": final.get("decision_status"),
+        "action": "manifest_only",
+    }
+
+
 def _provider_errors_json(provider_results: list[dict] | None) -> str:
     return _compact_json(
         {
@@ -589,6 +743,30 @@ def _bootstrap_checkpoint_from_csv(
                     "sha256": row.get("sha256"),
                     "final": {"decision_status": status},
                 }
+            )
+            restored += 1
+    return restored
+
+
+def _bootstrap_manifest_from_csv(
+    csv_path: Path,
+    manifest_path: Path,
+    input_dir: Path,
+) -> int:
+    restored = 0
+    with manifest_path.open("w", encoding="utf-8") as manifest_file:
+        for row in _iter_csv_rows(csv_path):
+            record = {
+                "relative_path": row.get("relative_path"),
+                "final": {
+                    "best_task_type": row.get("best_task_type"),
+                    "best_anomaly_type": row.get("best_anomaly_type"),
+                    "decision_status": row.get("decision_status"),
+                },
+            }
+            manifest_file.write(
+                json.dumps(_record_to_manifest_item(record, input_dir), ensure_ascii=False)
+                + "\n"
             )
             restored += 1
     return restored

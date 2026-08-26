@@ -76,7 +76,11 @@ PROVIDERS = [
 
 DATA_CONFIG = {
     "input_dir": PROJECT_ROOT / "data",
-    "recursive": False,
+    # True: walk all subdirectories under input_dir (needed when the dataset
+    # is split across many subfolders, e.g. cvdata_clean001/, cvdata_clean002/,
+    # ...). False only looks at files directly inside input_dir and silently
+    # skips everything in subfolders.
+    "recursive": True,
     "allowed_mime_types": {
         "image/jpeg",
         "image/png",
@@ -108,12 +112,20 @@ TASK_CLASSIFICATION_CONFIG = {
     "request_retries": 2,
     "retry_sleep_seconds": 2,
     "disable_provider_after_consecutive_failures": 5,
+    # After being disabled, a provider is retried (one probe request) once
+    # this many seconds have passed, instead of staying disabled for the
+    # rest of the run. Prevents a transient network issue from silently
+    # routing the remainder of a large batch to a single-provider fallback.
+    "provider_reenable_cooldown_seconds": 300,
     "resume": True,
     "checkpoint_file": PROJECT_ROOT / "outputs" / "task_type_classification" / "checkpoint.sqlite3",
     "checkpoint_failed": False,
     "progress_log_interval": 100,
     "save_provider_raw_response": False,
     "write_summary": True,
+    # "auto": draw a live progress bar only when stderr is a real terminal
+    # (never on redirected/nohup/CI output); True/False force it on/off.
+    "progress_bar": "auto",
 }
 
 
@@ -123,10 +135,17 @@ TASK_ORGANIZATION_CONFIG = {
     "classification_results_file": TASK_CLASSIFICATION_CONFIG["output_dir"] / "results.csv",
     "output_dir": PROJECT_ROOT / "data_by_task",
     "copy_files": True,
+    # When False, skip copying/moving image files entirely and only write
+    # relative_path -> best_task_type/best_anomaly_type into manifest.jsonl.
+    # For large datasets this avoids duplicating (or relocating) every file
+    # on disk; downstream consumers can read the manifest as a mapping table
+    # and resolve original files by relative_path instead.
+    "materialize_files": True,
     "overwrite": True,
     "unclassified_dir": "_未分类",
     "write_manifest": True,
     "manifest_file": PROJECT_ROOT / "data_by_task" / "manifest.jsonl",
     "summary_file": PROJECT_ROOT / "data_by_task" / "summary.json",
     "progress_log_interval": 100,
+    "progress_bar": "auto",
 }
